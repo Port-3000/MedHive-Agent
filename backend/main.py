@@ -2,6 +2,7 @@
 from fastapi import FastAPI, UploadFile, Form, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
+import numpy as np  # Add explicit import for numpy
 import io
 import os
 import httpx
@@ -49,6 +50,26 @@ def clean_csv_data(df):
     for column in df.select_dtypes(include=['float64', 'int64']).columns:
         if df[column].isnull().any():
             df[column].fillna(df[column].mean(), inplace=True)
+        
+        # Handle infinity values (not JSON compliant)
+        if np.isinf(df[column]).any():
+            # Replace infinity values with the column's max/min or a reasonable large/small value
+            max_val = df[column][~np.isinf(df[column]) | (df[column] < 0)].max()
+            min_val = df[column][~np.isinf(df[column]) | (df[column] > 0)].min()
+            
+            # If all values are inf/-inf, use fallback values
+            if pd.isna(max_val):
+                max_val = 1e30  # A very large number
+            if pd.isna(min_val):
+                min_val = -1e30  # A very small number
+                
+            # Replace inf with max value and -inf with min value
+            df[column].replace(float('inf'), max_val, inplace=True)
+            df[column].replace(float('-inf'), min_val, inplace=True)
+            
+        # Check for NaN values after all operations and fix them
+        if df[column].isnull().any():
+            df[column].fillna(0, inplace=True)  # Fill any remaining NaNs with 0
     
     # 2. Ensure 'diagnosis' column contains only valid values (M or B)
     if 'diagnosis' in df.columns:
@@ -63,39 +84,41 @@ def clean_csv_data(df):
 
 # Function to upload data to Supabase
 async def upload_to_supabase(df):
+    print("Uploading data to Supabase...")
     try:
+        # Additional safety check for JSON compatibility
+        # Replace any remaining NaN values with None (null in JSON)
+        df = df.where(pd.notnull(df), None)
+        
         # Convert DataFrame to records (list of dictionaries)
         records = df.to_dict(orient='records')
+        
+        # Extra validation - check for and clean any problematic values
+        for record in records:
+            for key, value in record.items():
+                # Handle any float values that might cause JSON issues
+                if isinstance(value, float) and (pd.isna(value) or np.isinf(value)):
+                    record[key] = None
         
         # Create table if it doesn't exist (first time)
         try:
             # Check if table exists
             supabase_client.table('medical_diagnostics').select('id').limit(1).execute()
         except:
-            # Create table schema based on DataFrame columns
-            # This is a simplified approach - in production, you would want more control over schema creation
-            columns = []
-            for col_name, dtype in df.dtypes.items():
-                if col_name == 'id':
-                    col_type = 'text primary key'
-                elif dtype == 'object':
-                    col_type = 'text'
-                else:
-                    col_type = 'float'
-                columns.append(f"{col_name} {col_type}")
+            # Instead of trying to execute SQL directly, we'll use the predefined schema
+            # Or alternatively, use supabase_client.rpc() to call a stored procedure
+            # that creates the table (which would need to be defined in your Supabase project)
             
-            create_table_query = f"""
-            CREATE TABLE IF NOT EXISTS medical_diagnostics (
-                {', '.join(columns)}
-            );
-            """
-            # Execute raw SQL query to create table
-            supabase_client.table('medical_diagnostics').execute_sql(create_table_query)
+            # For this implementation, let's just use the schema we already have in supabase/schema.sql
+            # We assume the table is already created in Supabase through migrations
+            # or we're using an existing table
+            pass
         
-        # Insert data
+        # Insert data - this part works fine
         result = supabase_client.table('medical_diagnostics').insert(records).execute()
         return {"success": True, "records_added": len(records)}
     except Exception as e:
+        print(f"Error uploading to Supabase: {str(e)}")
         return {"success": False, "error": str(e)}
 
 # Function to process the LLM request through Groq
